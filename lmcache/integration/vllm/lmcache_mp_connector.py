@@ -42,6 +42,7 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
 )
 from lmcache.integration.vllm.kv_cache_groups import (
     create_engine_group_infos_from_vllm,
+    get_group_recurrent_flags,
     get_tokens_per_block,
 )
 from lmcache.integration.vllm.lazy_offload_pending_store import (
@@ -472,6 +473,9 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         group_tokens_per_block = get_group_tokens_per_block(
             vllm_config, kv_cache_config
         )
+        group_recurrent_flags = get_group_recurrent_flags(
+            kv_cache_config, len(group_tokens_per_block)
+        )
         scheduler_block_size = get_vllm_scheduler_block_size(
             vllm_config, kv_cache_config
         )
@@ -635,6 +639,10 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # the engine's base block size when no group metadata is available
         # (single non-hybrid group).
         self._group_tokens_per_block = group_tokens_per_block
+        # Index-aligned with _group_tokens_per_block; empty means no group
+        # metadata (single attention group). Recurrent (snapshotting Mamba/
+        # GDN) groups do not bound the storable token prefix.
+        self._group_recurrent_flags = group_recurrent_flags
         for engine_group_idx, tokens_per_block in enumerate(
             self._group_tokens_per_block
         ):
@@ -1368,6 +1376,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 group_tokens_per_block=self._group_tokens_per_block,
+                recurrent_groups=self._group_recurrent_flags or None,
             )
             if r_metadata is not None:
                 metadata.add_request_metadata(r_metadata)
@@ -1390,6 +1399,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
+                recurrent_groups=self._group_recurrent_flags or None,
             )
             if r_meta is not None:
                 # In lazy_offload mode, add to pending queue instead of immediate store
@@ -1430,6 +1440,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
                 request_tracker,
                 lmcache_tokens_per_chunk,
                 self._group_tokens_per_block,
+                recurrent_groups=self._group_recurrent_flags or None,
             )
 
             if r_meta is not None:

@@ -182,33 +182,72 @@ def slice_block_ids_per_group(
     group_tokens_per_block: Sequence[int],
     start_token_idx: int,
     end_token_idx: int,
+    recurrent_groups: Sequence[bool] | None = None,
 ) -> list[list[int]]:
     """Slice each engine group's block IDs for a token range.
 
     The range is given in tokens — the only unit shared by every engine
-    group. A group whose paged chunks each cover ``tokens_per_block`` tokens
-    holds one block ID per ``tokens_per_block`` tokens, so the range is
-    divided by that group's ``tokens_per_block``. Example: over the same 256
-    tokens, a tokens_per_block-64 group gets 4 IDs while a
-    tokens_per_block-256 group gets 1.
+    group. An attention group whose paged chunks each cover
+    ``tokens_per_block`` tokens holds one block ID per ``tokens_per_block``
+    tokens, so the range is divided by that group's ``tokens_per_block``.
+    Example: over the same 256 tokens, a tokens_per_block-64 group gets 4
+    IDs while a tokens_per_block-256 group gets 1.
+
+    Recurrent-state groups (flagged via ``recurrent_groups``) hold
+    constant-size state snapshots whose page count does not scale with
+    tokens, so they bypass token-range slicing and instead contribute a
+    range-length list matching the attention convention:
+      * when the engine provided a full per-block ID table covering the
+        range (align-mode snapshot tables), it is sliced verbatim — the
+        engine already placed its null block at skipped slots, which the
+        server's all-null chunk skip is built for;
+      * otherwise (a rolling single state page), every slot is the null
+        block except the final one, which carries the request's most
+        recent state block ID.
+    Both forms only commit the final chunk server-side, which is the
+    restore-correct semantic for state pages.
 
     Args:
         allocated_block_ids: Block IDs keyed by engine group id; a missing group
             yields an empty list.
         group_tokens_per_block: Each group's tokens-per-paged-chunk, in
-            engine-group order. Every value must be positive and divide both
-            range endpoints.
+            engine-group order. Every attention-group value must be positive
+            and divide both range endpoints.
         start_token_idx: Range start token index, inclusive.
         end_token_idx: Range end token index, exclusive.
+        recurrent_groups: Per-group recurrent-state flags in engine-group
+            order; ``None`` (default) treats every group as attention
+            (pre-existing behavior).
 
     Returns:
         One block-ID list per engine group, in engine-group order.
 
     Raises:
-        ValueError: If the range does not align to a group's chunk boundary.
+        ValueError: If the range does not align to an attention group's
+            chunk boundary (recurrent groups are range-agnostic state
+            snapshots and skip the alignment check).
     """
+    recurrent = recurrent_groups or ()
     sliced: list[list[int]] = []
     for engine_group_idx, tokens_per_block in enumerate(group_tokens_per_block):
+        is_recurrent = engine_group_idx < len(recurrent) and recurrent[engine_group_idx]
+        group_block_ids = list(allocated_block_ids.get(engine_group_idx, []))
+        if is_recurrent:
+            expected_len = (end_token_idx - start_token_idx) // tokens_per_block
+            if len(group_block_ids) >= end_token_idx // tokens_per_block:
+                # Engine-provided full block table: trust it verbatim.
+                sliced.append(
+                    group_block_ids[
+                        start_token_idx // tokens_per_block : end_token_idx
+                        // tokens_per_block
+                    ]
+                )
+            else:
+                padded = [0] * max(expected_len, 0)
+                if padded and group_block_ids:
+                    padded[-1] = group_block_ids[-1]
+                sliced.append(padded)
+            continue
         if start_token_idx % tokens_per_block != 0 or (
             end_token_idx % tokens_per_block != 0
         ):
@@ -217,14 +256,10 @@ def slice_block_ids_per_group(
                 f"align to group {engine_group_idx} tokens_per_block "
                 f"{tokens_per_block}"
             )
-        group_block_ids = allocated_block_ids.get(engine_group_idx, [])
         sliced.append(
-            list(
-                group_block_ids[
-                    start_token_idx // tokens_per_block : end_token_idx
-                    // tokens_per_block
-                ]
-            )
+            group_block_ids[
+                start_token_idx // tokens_per_block : end_token_idx // tokens_per_block
+            ]
         )
     return sliced
 
