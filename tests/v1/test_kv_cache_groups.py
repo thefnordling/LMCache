@@ -1,4 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
+# Standard
+from types import SimpleNamespace
+
 # Third Party
 import msgspec
 
@@ -180,3 +183,121 @@ def test_slice_block_ids_misaligned_range_raises():
         assert "does not align" in str(exc)
     else:
         raise AssertionError("Expected misaligned range to fail")
+
+
+####
+# Recurrent-state slicing: state pages gate presence, never the token
+# prefix, and bypass range slicing. Regression scenario: live GDN hybrid
+# (chunk 1600; attention groups 1600 tokens/block; one short-conv ring
+# group at 8 tokens/block holding a single rolling state page).
+####
+
+_HYBRID_TPB = [1600, 8, 1600]
+_HYBRID_RECURRENT = [False, True, False]
+
+
+def test_slice_recurrent_rolling_page_null_padded():
+    allocated = {0: [10, 11, 12], 1: [42], 2: [20, 21, 22]}
+    sliced = slice_block_ids_per_group(
+        allocated,
+        group_tokens_per_block=_HYBRID_TPB,
+        start_token_idx=0,
+        end_token_idx=4800,
+        recurrent_groups=_HYBRID_RECURRENT,
+    )
+    assert sliced[0] == [10, 11, 12]
+    assert sliced[2] == [20, 21, 22]
+    # Ring group: one slot per 8 tokens over the range; all null except the
+    # final slot, carrying the request's most recent state block.
+    assert sliced[1] == [0] * 599 + [42]
+
+
+def test_slice_recurrent_full_table_trusted_verbatim():
+    # Engine provided a full per-block table (align-mode snapshot style):
+    # slice like attention, nulls included, no synthesis.
+    allocated = {0: [10], 2: [20]}
+    allocated[1] = [0] * 200 + [77] + [0] * 399
+    sliced = slice_block_ids_per_group(
+        allocated,
+        group_tokens_per_block=_HYBRID_TPB,
+        start_token_idx=0,
+        end_token_idx=4800,
+        recurrent_groups=_HYBRID_RECURRENT,
+    )
+    assert sliced[1] == allocated[1]
+
+
+def test_slice_recurrent_group_skips_alignment_check():
+    # Range aligned to the attention groups; the 8-token recurrent group
+    # must not raise regardless (state snapshots are range-agnostic).
+    allocated = {0: [10, 11], 1: [5], 2: [20, 21]}
+    sliced = slice_block_ids_per_group(
+        allocated,
+        group_tokens_per_block=_HYBRID_TPB,
+        start_token_idx=0,
+        end_token_idx=3200,
+        recurrent_groups=_HYBRID_RECURRENT,
+    )
+    assert sliced[1] == [0] * 399 + [5]
+
+
+def test_slice_attention_misalignment_still_raises_with_recurrent_present():
+    try:
+        slice_block_ids_per_group(
+            {0: [1], 1: [5], 2: [2]},
+            group_tokens_per_block=_HYBRID_TPB,
+            start_token_idx=4,
+            end_token_idx=1600,
+            recurrent_groups=_HYBRID_RECURRENT,
+        )
+    except ValueError as exc:
+        assert "does not align" in str(exc)
+    else:
+        raise AssertionError("misaligned attention range must raise")
+
+
+def test_slice_without_recurrent_flags_is_legacy_behavior():
+    allocated = {0: [10, 11, 12], 1: [42], 2: [20, 21, 22]}
+    sliced = slice_block_ids_per_group(
+        allocated,
+        group_tokens_per_block=_HYBRID_TPB,
+        start_token_idx=0,
+        end_token_idx=4800,
+    )
+    # Group 1 sliced by range (legacy): 4800/8 = 600 slots from a 1-id list.
+    assert sliced == [[10, 11, 12], [42], [20, 21, 22]]
+
+
+####
+# Group state-page flags (public scheduler-side API): recurrent groups cover
+# constant-size state pages of any cache mode, and a caller-geometry
+# disagreement falls back to all-attention gating.
+####
+
+
+def _fake_group(spec, names):
+    return SimpleNamespace(kv_cache_spec=spec, layer_names=names)
+
+
+def test_recurrent_flags_cover_state_pages_including_rolling_modes():
+    # First Party
+    from lmcache.integration.vllm.kv_cache_groups import get_group_recurrent_flags
+
+    class MambaSpec:  # detected by class name (documented contract)
+        block_size = 1600
+        mamba_cache_mode = "none"  # rolling: still a constant-size state page
+
+    class CircularBufferSpec:
+        block_size = 8
+
+    cfg = SimpleNamespace(
+        kv_cache_groups=[
+            _fake_group(SimpleNamespace(block_size=1600), ["full0"]),
+            _fake_group(MambaSpec(), ["gdn0"]),
+            _fake_group(CircularBufferSpec(), ["ring0"]),
+        ]
+    )
+    assert get_group_recurrent_flags(cfg) == [False, True, True]
+    # Caller-provided geometry: matching count accepted, mismatch falls back.
+    assert get_group_recurrent_flags(cfg, 3) == [False, True, True]
+    assert get_group_recurrent_flags(cfg, 6) == []

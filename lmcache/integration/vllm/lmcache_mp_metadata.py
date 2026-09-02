@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Standard
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal
 import enum
@@ -189,6 +190,7 @@ class LMCacheMPRequestMetadata:
         tracker: LMCacheMPRequestTracker,
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
+        recurrent_groups: "Sequence[bool] | None" = None,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the store metadata for the current request tracker.
@@ -200,8 +202,14 @@ class LMCacheMPRequestMetadata:
                 paged chunk (one block ID) of that group, i.e. the group's
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+            recurrent_groups: per-engine-group recurrent-state flags in the
+                same order as ``group_tokens_per_block``; recurrent (Mamba/GDN
+                snapshot, circular-buffer) groups are presence-gated only and
+                never bound the token prefix. Their block IDs are produced by
+                :func:`slice_block_ids_per_group`, which trusts the engine's
+                full block table or emits a null-padded last-block snapshot.
+                ``None`` means all groups are attention (legacy behavior).
         """
-        num_engine_groups = len(group_tokens_per_block)
         # NOTE: the invariant here is that `num_stored_tokens` should
         # always be a multiple of `lmcache_tokens_per_chunk`
         # TODO: This should be checked every time we update the num_stored_tokens
@@ -226,25 +234,30 @@ class LMCacheMPRequestMetadata:
         computed_tokens = tracker.num_scheduled_tokens + max(
             tracker.num_vllm_hit_tokens, tracker.num_lmcache_hit_tokens
         )
-        # Each group covers ``len(block_ids) * tokens_per_block`` tokens; the
-        # storable prefix is bounded by the least-covered group (e.g.
-        # gemma-4 sliding: one 32-token ID covers 2x the tokens of a
-        # 16-token full-attention ID).
+        # Each attention group covers ``len(block_ids) * tokens_per_block``
+        # tokens; the storable prefix is bounded by the least-covered group
+        # (e.g. gemma-4 sliding: one 32-token ID covers 2x the tokens of a
+        # 16-token full-attention ID). Recurrent-state groups do NOT bound
+        # the token prefix: their pages hold constant-size state snapshots,
+        # so allocation does not scale with prompt length. They only gate
+        # presence (a state page must exist before anything is storable);
+        # block-id emission for them is handled by
+        # :func:`slice_block_ids_per_group`.
+        recurrent = recurrent_groups or ()
         allocated_lengths = tracker.num_allocated_blocks()
-        allocated_tokens = (
-            min(
-                allocated_lengths.get(engine_group_idx, 0)
-                * group_tokens_per_block[engine_group_idx]
-                for engine_group_idx in range(num_engine_groups)
-            )
-            if num_engine_groups > 0
-            else 0
-        )
         min_available_tokens = min(
             len(tracker.all_token_ids),
-            allocated_tokens,
             computed_tokens,
         )
+        for engine_group_idx, tokens_per_block in enumerate(group_tokens_per_block):
+            if engine_group_idx < len(recurrent) and recurrent[engine_group_idx]:
+                if allocated_lengths.get(engine_group_idx, 0) == 0:
+                    # No state page allocated yet: nothing is storable.
+                    return None
+                continue
+            coverage = allocated_lengths.get(engine_group_idx, 0) * tokens_per_block
+            if coverage < min_available_tokens:
+                min_available_tokens = coverage
         num_staging_tokens = min_available_tokens - tracker.num_stored_tokens
         num_chunks = num_staging_tokens // lmcache_tokens_per_chunk
 
@@ -256,6 +269,7 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
+                recurrent_groups=recurrent_groups,
             )
             token_ids = tracker.get_token_ids()
             op = LoadStoreOp(
@@ -284,6 +298,7 @@ class LMCacheMPRequestMetadata:
         tracker: LMCacheMPRequestTracker,
         lmcache_tokens_per_chunk: int,
         group_tokens_per_block: list[int],
+        recurrent_groups: "Sequence[bool] | None" = None,
     ) -> "LMCacheMPRequestMetadata | None":
         """
         Generate the retrieve metadata for the current request tracker.
@@ -295,6 +310,13 @@ class LMCacheMPRequestMetadata:
                 paged chunk (one block ID) of that group, i.e. the group's
                 KV cache spec ``block_size``. Must each divide
                 ``lmcache_tokens_per_chunk`` (hybrid models can mix different values).
+            recurrent_groups: per-engine-group recurrent-state flags in the
+                same order as ``group_tokens_per_block``; recurrent (Mamba/GDN
+                snapshot, circular-buffer) groups are presence-gated only and
+                never bound the token prefix. Their block IDs are produced by
+                :func:`slice_block_ids_per_group`, which trusts the engine's
+                full block table or emits a null-padded last-block snapshot.
+                ``None`` means all groups are attention (legacy behavior).
         """
         if not tracker.is_ready_for_retrieving():
             return None
@@ -324,6 +346,7 @@ class LMCacheMPRequestMetadata:
                 group_tokens_per_block,
                 start_token_idx,
                 end_token_idx,
+                recurrent_groups=recurrent_groups,
             )
             token_ids = tracker.get_token_ids()
 

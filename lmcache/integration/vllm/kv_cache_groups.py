@@ -70,6 +70,17 @@ def _is_cachable_mamba_spec(spec: Any) -> bool:
     ) in ("align", "all")
 
 
+def _is_circular_buffer_spec(spec: Any) -> bool:
+    """Return whether the spec is a vLLM circular-buffer (short-conv ring).
+
+    A ring's single page covers the whole sequence, so like snapshotting
+    Mamba it is required only at the last committed boundary. Checked by
+    class name (like :func:`_is_sliding_window_spec`) so this module stays
+    importable without vLLM.
+    """
+    return any(cls.__name__ == "CircularBufferSpec" for cls in type(spec).__mro__)
+
+
 def _resolve_per_layer_sw_sizes(
     vllm_groups: Sequence[Any],
     layer_to_idx: Mapping[str, int],
@@ -87,9 +98,10 @@ def _resolve_per_layer_sw_sizes(
     Returns:
         A list of length ``num_layers`` mapping each registered tensor index
         to its cross-chunk window size in tokens: the sliding window for
-        sliding-window attention, the engine-side block size for align-mode
-        Mamba/linear layers (a one-block window), or ``-1`` for full-attention
-        layers.
+        sliding-window attention, the engine-side block size for state-page
+        layers that commit reusable boundary snapshots (align-mode Mamba/GDN
+        and circular-buffer rings; both one-block windows), or ``-1`` for
+        full-attention layers and non-snapshotting Mamba modes.
     """
     per_layer_sw_size = [-1] * num_layers
     for group in vllm_groups:
@@ -103,7 +115,16 @@ def _resolve_per_layer_sw_sizes(
             layer_spec = per_layer_specs[name] if per_layer_specs else spec
             if _is_sliding_window_spec(layer_spec):
                 per_layer_sw_size[layer_to_idx[name]] = layer_spec.sliding_window
-            elif _is_cachable_mamba_spec(layer_spec):
+            elif _is_cachable_mamba_spec(layer_spec) or _is_circular_buffer_spec(
+                layer_spec
+            ):
+                # Snapshotting Mamba pages and circular-buffer rings are
+                # required only at the boundary they were committed to, which
+                # the lookup fold expresses as a one-block window. Treating
+                # rings as full attention (-1) demanded objects that
+                # legitimately never exist at other boundaries, zeroing every
+                # prefix hit for hybrid models. Non-snapshotting Mamba modes
+                # stay un-windowed: vLLM cannot reuse their pages on a hit.
                 per_layer_sw_size[layer_to_idx[name]] = layer_spec.block_size
     return per_layer_sw_size
 
@@ -166,9 +187,10 @@ def _resolve_per_layer_recurrent(
         num_layers: Number of registered KV tensors.
 
     Returns:
-        A list of length ``num_layers``: ``True`` for Mamba/linear-attention
-        layers in a snapshotting cache mode (see :func:`_is_cachable_mamba_spec`),
-        ``False`` for attention layers.
+        A list of length ``num_layers``: ``True`` for constant-size state
+        pages — Mamba/linear-attention of any cache mode and circular-buffer
+        rings (see :func:`_is_state_page_spec`) — ``False`` for attention
+        layers.
     """
     per_layer_recurrent = [False] * num_layers
     for group in vllm_groups:
@@ -178,7 +200,7 @@ def _resolve_per_layer_recurrent(
         per_layer_specs = getattr(spec, "kv_cache_specs", None)
         for name in group.layer_names:
             layer_spec = per_layer_specs[name] if per_layer_specs else spec
-            if _is_cachable_mamba_spec(layer_spec):
+            if _is_state_page_spec(layer_spec):
                 per_layer_recurrent[layer_to_idx[name]] = True
     return per_layer_recurrent
 
@@ -382,3 +404,74 @@ def create_engine_group_infos_from_vllm(
             per_layer_group_idx,
         )
     ]
+
+
+def _is_state_page_spec(spec: Any) -> bool:
+    """Return whether a leaf spec holds constant-size recurrent/circular state.
+
+    Covers snapshotting and rolling Mamba/GDN pages (any ``mamba_cache_mode``,
+    unlike :func:`_is_cachable_mamba_spec` which gates on snapshot support)
+    and vLLM ``CircularBufferSpec`` (short-conv ring buffers whose single
+    page covers the whole sequence regardless of length). Checked by class
+    name so this module stays importable without vLLM.
+    """
+    names = {cls.__name__ for cls in type(spec).__mro__}
+    return bool(names & {"MambaSpec", "CircularBufferSpec"})
+
+
+def get_group_recurrent_flags(
+    kv_cache_config: Any, expected_num_groups: "int | None" = None
+) -> list[bool]:
+    """Per-engine-group state-page flags for store/retrieve gating.
+
+    A group is a state group when every layer it covers holds
+    constant-size recurrent/circular state (see
+    :func:`_is_state_page_spec`). Mirrors the engine-group order of
+    ``lmcache_mp_connector.get_group_tokens_per_block`` so the two lists
+    are index-aligned; returns an empty list when the engine reports no
+    group metadata (callers treat the model as a single attention group).
+
+    Args:
+        kv_cache_config: vLLM ``KVCacheConfig`` (or ``None``).
+        expected_num_groups: Number of engine groups the caller resolved
+            geometry for. When the engine's group metadata disagrees with
+            that count, a warning is logged and ``[]`` is returned so the
+            caller falls back to all-attention gating rather than guessing
+            which group holds state.
+
+    Returns:
+        One flag per engine group, in engine-group order; empty when no
+        group metadata is available or the geometry disagrees with
+        ``expected_num_groups``.
+    """
+    groups = (
+        (getattr(kv_cache_config, "kv_cache_groups", ()) or ())
+        if kv_cache_config is not None
+        else ()
+    )
+    flags: list[bool] = []
+    for group in groups:
+        spec = getattr(group, "kv_cache_spec", None)
+        if spec is None:
+            flags.append(False)
+            continue
+        per_layer_specs = getattr(spec, "kv_cache_specs", None)
+        if per_layer_specs:
+            flags.append(
+                bool(group.layer_names)
+                and all(
+                    _is_state_page_spec(per_layer_specs[name])
+                    for name in group.layer_names
+                )
+            )
+        else:
+            flags.append(_is_state_page_spec(spec))
+    if flags and expected_num_groups is not None and len(flags) != expected_num_groups:
+        logger.warning(
+            "State-page flags (%d groups) disagree with resolved geometry "
+            "(%d); falling back to all-attention gating.",
+            len(flags),
+            expected_num_groups,
+        )
+        return []
+    return flags

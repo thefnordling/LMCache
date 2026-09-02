@@ -64,6 +64,12 @@ class MambaSpec:
 
 
 @dataclass
+class CircularBufferSpec(AttentionSpec):
+    """vLLM circular-buffer (short-conv ring) spec (detected by class name):
+    one rolling page covers the whole sequence regardless of length."""
+
+
+@dataclass
 class UniformTypeKVCacheSpecs:
     block_size: int
     kv_cache_specs: "dict[str, object]" = field(default_factory=dict)
@@ -219,6 +225,27 @@ def test_conversion_resolves_mamba_align_window():
     )
 
     assert [group.sw_size_tokens for group in spec] == [-1, 16]
+
+
+def test_conversion_state_pages_get_one_block_window():
+    """Align-mode Mamba snapshots and circular-buffer rings commit reusable
+    boundary state, so each carries a one-block cross-chunk window
+    (``sw_size_tokens == block_size``) and registers as a recurrent-state
+    group. This is the lookup-fold contract that lets hybrid models hit:
+    state groups are required only at the boundary they were committed to."""
+    spec = create_engine_group_infos_from_vllm(
+        MockKVCacheConfig(
+            kv_cache_groups=[
+                MockKVCacheGroup(["layer.0"], FullAttentionSpec(block_size=16)),
+                MockKVCacheGroup(["layer.1"], MambaSpec(block_size=16)),
+                MockKVCacheGroup(["layer.2"], CircularBufferSpec(block_size=16)),
+            ]
+        ),
+        _same_shape_caches(["layer.0", "layer.1", "layer.2"]),
+    )
+
+    assert [group.sw_size_tokens for group in spec] == [-1, 16, 16]
+    assert [group.recurrent_state for group in spec] == [False, True, True]
 
 
 def test_conversion_mamba_non_align_not_windowed():
