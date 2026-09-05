@@ -41,6 +41,8 @@ from lmcache.integration.vllm.kv_cache_group_edits import (
     validate_kv_cache_groups,
 )
 from lmcache.integration.vllm.kv_cache_groups import (
+    cap_lookup_prefix_tokens,
+    clamp_full_prompt_hit,
     create_engine_group_infos_from_vllm,
     get_group_recurrent_flags,
     get_tokens_per_block,
@@ -971,6 +973,15 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             if self.lazy_offload:
                 self._pending_store.bind_gpu_block_pool(gpu_block_pool)
 
+    def _lookup_prefix(self, token_ids: list[int]) -> list[int]:
+        """Token list to submit for lookup (see cap_lookup_prefix_tokens)."""
+        cap = cap_lookup_prefix_tokens(
+            len(token_ids),
+            self.scheduler_adapter.lmcache_tokens_per_chunk,
+            self._group_recurrent_flags,
+        )
+        return token_ids[:cap]
+
     def get_num_new_matched_tokens(
         self,
         request: "Request",
@@ -1044,7 +1055,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
 
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
-            token_ids=tracker.get_token_ids(),
+            token_ids=self._lookup_prefix(tracker.get_token_ids()),
             cache_salt=tracker.cache_salt,
             request_configs=tracker.request_configs,
         )
@@ -1057,6 +1068,19 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
             return 0, False
 
         assert ret % self.scheduler_adapter.lmcache_tokens_per_chunk == 0
+
+        # A full-prompt hit must not be served at its end boundary when the
+        # model has recurrent-state groups: the snapshot committed there
+        # already includes the final token the scheduler is about to
+        # recompute, and recurrent state cannot be replayed (see
+        # clamp_full_prompt_hit). Floor to the previous chunk boundary
+        # before any tracker bookkeeping so retrieve/store bounds agree.
+        ret = clamp_full_prompt_hit(
+            ret,
+            len(request.all_token_ids),
+            self.scheduler_adapter.lmcache_tokens_per_chunk,
+            self._group_recurrent_flags,
+        )
 
         # Update num stored tokens for the tracker
         tracker.increase_num_stored_tokens(ret)
@@ -1077,7 +1101,12 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         # In full-prompt-hit case, we need to recompute the last token.
         # Without this, num_computed_tokens would equal request.num_tokens,
         # causing num_new_tokens to be 0 and triggering the
-        # `assert num_new_tokens > 0` in the scheduler.
+        # `assert num_new_tokens > 0` in the scheduler. Recurrent hybrids
+        # normally never reach this branch with a full-prompt hit: the
+        # lookup prefix cap in _lookup_prefix() prevents the server from
+        # locking at the end boundary, and clamp_full_prompt_hit floors any
+        # hit that still arrives (e.g. a resumed request whose prompt plus
+        # generated tokens realign to the chunk grid).
         if ret == len(request.all_token_ids):
             need_to_load = max(0, need_to_load - 1)
 
@@ -1100,7 +1129,7 @@ class LMCacheMPConnector(KVConnectorBase_V1, SupportsHMA):
         tracker = self._get_or_create_request_tracker(request)
         self.scheduler_adapter.maybe_submit_lookup_request(
             request.request_id,
-            token_ids=list(request.all_token_ids),
+            token_ids=self._lookup_prefix(list(request.all_token_ids)),
             cache_salt=tracker.cache_salt,
             request_configs=tracker.request_configs,
         )

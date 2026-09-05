@@ -475,3 +475,84 @@ def get_group_recurrent_flags(
         )
         return []
     return flags
+
+
+def clamp_full_prompt_hit(
+    hit_tokens: int,
+    prompt_tokens: int,
+    lmcache_tokens_per_chunk: int,
+    recurrent_groups: "Sequence[bool] | None",
+) -> int:
+    """Floor a full-prompt lookup hit to the previous chunk boundary on hybrids.
+
+    vLLM's scheduler always recomputes the prompt's final token to produce
+    logits for the first sampled token. Attention KV tolerates that replay
+    (recomputing a token overwrites its page with identical values), but a
+    recurrent-state snapshot committed at the full-prompt boundary already
+    folds the final token's recurrence in: resuming one token before that
+    boundary applies it twice and corrupts the hidden state, so hybrid
+    models must resume at the boundary whose snapshot matches the
+    recomputation start — the previous chunk boundary.
+
+    Called by ``LMCacheMPConnector.get_num_new_matched_tokens`` with the hit
+    length from ``check_lookup_result`` (a multiple of the chunk size; zero
+    hits are handled by the caller before this function) before any tracker
+    bookkeeping, so hit accounting, retrieve ranges and store bounds stay
+    consistent with the returned value.
+
+    Args:
+        hit_tokens: Lookup hit length in tokens, a positive multiple of
+            ``lmcache_tokens_per_chunk``.
+        prompt_tokens: Total request tokens (``len(request.all_token_ids)``).
+        lmcache_tokens_per_chunk: Connector chunk size in tokens.
+        recurrent_groups: Per-engine-group state-page flags in engine-group
+            order (see :func:`get_group_recurrent_flags`); empty/``None`` or
+            all-``False`` means no recurrent-state group.
+
+    Returns:
+        ``hit_tokens - lmcache_tokens_per_chunk`` (clamped at 0) when the hit
+        covers the entire prompt and a recurrent-state group exists, else
+        ``hit_tokens`` unchanged.
+    """
+    if hit_tokens == prompt_tokens and recurrent_groups and any(recurrent_groups):
+        return max(hit_tokens - lmcache_tokens_per_chunk, 0)
+    return hit_tokens
+
+
+def cap_lookup_prefix_tokens(
+    num_tokens: int,
+    lmcache_tokens_per_chunk: int,
+    recurrent_groups: "Sequence[bool] | None",
+) -> int:
+    """Cap the token prefix submitted for lookup on chunk-aligned prompts.
+
+    ``clamp_full_prompt_hit`` post-processing is not enough for hybrid
+    models: the MP server read-locks the window-suffix state objects at the
+    boundary the *lookup* reported, so a retrieve shortened afterwards would
+    request objects that exist but were never locked
+    (``KEY_NOT_READABLE``). Cap the lookup itself: for a recurrent model with
+    a chunk-aligned prompt, look up only the first ``num_tokens -
+    lmcache_tokens_per_chunk`` tokens. The rolling chunk-hash prefix chain
+    makes truncation harmless for shorter true hits, while a would-be
+    full-prompt hit now returns the clamped boundary, so lookup locking,
+    retrieve ranges and scheduler resume all agree on it.
+
+    Args:
+        num_tokens: Tokens the connector would submit for lookup.
+        lmcache_tokens_per_chunk: Connector chunk size in tokens.
+        recurrent_groups: Per-engine-group state-page flags (see
+            :func:`get_group_recurrent_flags`); ``None``/empty/all-``False``
+            means no recurrent-state group.
+
+    Returns:
+        ``num_tokens - lmcache_tokens_per_chunk`` for aligned prompts of at
+        least two chunks on recurrent hybrids, else ``num_tokens``.
+    """
+    if (
+        recurrent_groups
+        and any(recurrent_groups)
+        and num_tokens >= 2 * lmcache_tokens_per_chunk
+        and num_tokens % lmcache_tokens_per_chunk == 0
+    ):
+        return num_tokens - lmcache_tokens_per_chunk
+    return num_tokens

@@ -8,6 +8,8 @@ import torch
 
 # First Party
 from lmcache.integration.vllm.kv_cache_groups import (
+    cap_lookup_prefix_tokens,
+    clamp_full_prompt_hit,
     create_engine_group_infos_from_vllm,
 )
 from lmcache.v1.multiprocess.group_view import (
@@ -494,3 +496,48 @@ def test_conversion_tokens_per_block_unscaled_without_dcp():
 
     assert [g.tokens_per_block for g in default] == [16, 16]
     assert [g.tokens_per_block for g in explicit] == [16, 16]
+
+
+def test_clamp_full_prompt_hit_floors_recurrent_full_hit():
+    """A full-prompt hit on a model with a recurrent-state group must floor
+    to the previous chunk boundary: the snapshot at the prompt end already
+    includes the final token the scheduler will replay, and recurrent state
+    cannot be recomputed idempotently."""
+    assert clamp_full_prompt_hit(3200, 3200, 1600, [False, True, True]) == 1600
+
+
+def test_clamp_full_prompt_hit_keeps_partial_hits():
+    """Partial hits end at a boundary strictly inside the prompt, so the
+    engine resumes at the exact boundary whose snapshot is restored."""
+    assert clamp_full_prompt_hit(3200, 4800, 1600, [False, True, True]) == 3200
+
+
+def test_clamp_full_prompt_hit_keeps_attention_only():
+    """Attention-only models (no group flags, or all-False flags) keep the
+    exact-length hit: KV replay is idempotent for them."""
+    assert clamp_full_prompt_hit(3200, 3200, 1600, None) == 3200
+    assert clamp_full_prompt_hit(3200, 3200, 1600, []) == 3200
+    assert clamp_full_prompt_hit(3200, 3200, 1600, [False, False]) == 3200
+
+
+def test_clamp_full_prompt_hit_clamps_single_chunk_at_zero():
+    """A one-chunk full hit has no earlier snapshot boundary to fall back
+    to: the result is 0 (no external load), never a negative length."""
+    assert clamp_full_prompt_hit(1600, 1600, 1600, [False, True]) == 0
+
+
+def test_cap_lookup_prefix_shortens_aligned_recurrent():
+    assert cap_lookup_prefix_tokens(3200, 1600, [False, True, True]) == 1600
+    assert cap_lookup_prefix_tokens(6400, 1600, [False, True, True]) == 4800
+
+
+def test_cap_lookup_prefix_leaves_unaligned_and_short():
+    flags = [False, True, True]
+    assert cap_lookup_prefix_tokens(6408, 1600, flags) == 6408
+    assert cap_lookup_prefix_tokens(1600, 1600, flags) == 1600
+    assert cap_lookup_prefix_tokens(0, 1600, flags) == 0
+
+
+def test_cap_lookup_prefix_noop_without_recurrent_groups():
+    assert cap_lookup_prefix_tokens(3200, 1600, None) == 3200
+    assert cap_lookup_prefix_tokens(3200, 1600, [False, False]) == 3200
